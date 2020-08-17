@@ -7,3 +7,8 @@ host = ""
 username = ""
 password = ""
 database = ""
+
+[options] # Will be replaced with in guild options
+wiki-link = false
+min-time = 500
+min-profit = 200_000

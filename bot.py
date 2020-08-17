@@ -1,20 +1,22 @@
 import asyncio
 import base64
+import datetime
 import io
 import json
+import pathlib
+import sys
 import time
 from collections import defaultdict
-from constants import *
+
 import aiohttp
-import nbt.nbt as nbt
-from discord.ext import commands
-import sys
 import discord
-import requests
-import datetime
-import pathlib
-import toml
 import mysql.connector
+import nbt.nbt as nbt
+import requests
+import toml
+from discord.ext import commands
+
+from constants import *
 
 songs = defaultdict(lambda: [])
 
@@ -29,8 +31,9 @@ class AuctionGrabber:
     with open("alias.json", "r") as alias_file:
         aliases = json.loads(alias_file.read())
 
-    def __init__(self, key):
-        self.key = key
+    def __init__(self, config):
+        self.config = config
+        self.key = self.config['api']['hypixel']
         self.min_price = defaultdict(lambda: 0)
         self.auctions = []
         self.prices = defaultdict(lambda: [])
@@ -39,7 +42,7 @@ class AuctionGrabber:
 
     async def get_pages(self, max_page, session):
         tasks = [self.get_page(i, session) for i in range(max_page + 1)]
-        auc = await asyncio.gather(*tasks)
+        auc = [a for nested in await asyncio.gather(*tasks) for a in nested]
         if self.run_counter == 5:
             self.min_price['RECOMBOBULATOR_3000'] = \
                 json.loads(await (await session.get(BAZAAR_ENDPOINT.format(self.key))).text())['products'][
@@ -67,7 +70,7 @@ class AuctionGrabber:
             for auction in auctions:
                 if 'bin' not in auction or auction['bin'] is False or auction['end'] < time.time() * 1000:
                     continue
-                nbt_data, name, count = self.decode_item(auction['item_bytes'])
+                nbt_data, _, count = self.decode_item(auction['item_bytes'])
 
                 # todo images (from texture pack or head)
                 # if name not in self.images and 'SkullOwner' in nbt_data['tag'].keys():
@@ -79,19 +82,31 @@ class AuctionGrabber:
                 page_prices[name].append(auction['starting_bid'] / count)
             for k, v in page_prices.items():
                 self.prices[k].append(min(v))
-        return [auc for auc in auctions if auc['start'] > self.last_update and auc['end'] > time.time() * 1000]
+        return [auc for auc in auctions if
+                auc['start'] > self.last_update and (time.time() + 30) * 1000 < auc['end'] < (
+                        time.time() + self.config['options']['min-time']) * 1000]
 
-    async def check_flip(self):
+    async def check_flip(self) -> list:
         flips = []
         for item in self.auctions:
-            # todo
+            price = item['starting_bid'] if item['starting_bid'] > item['highest_bid_amount'] else item[
+                'highest_bid_amount']
+            nbt_data, _, count = AuctionGrabber.decode_item(item['item_bytes'])
+            name = AuctionGrabber.get_name(nbt_data)
+            if price < self.min_price[name] - self.config['options']['min-profit']:
+                flips.append(item)
             pass
+        return flips
 
     @staticmethod
     def decode_item(item):
         base64_decoded = base64.b64decode(item)
         file = nbt.NBTFile(fileobj=io.BytesIO(base64_decoded))['i'][0]
         return file, file['tag']['ExtraAttributes']['id'].value, file['Count'].value
+
+    @staticmethod
+    def format_uuid(uuid):
+        return "{}-{}-{}-{}-{}".format(uuid[:8], uuid[8:12], uuid[12:16], uuid[16:20], uuid[20:32])
 
     @staticmethod
     def get_name(nbt_data):
@@ -102,7 +117,7 @@ class AuctionGrabber:
                 ench = nbt_data['tag']['ExtraAttributes']['enchantments'].keys()[0]
                 if ench in ENCHANTS and nbt_data['tag']['ExtraAttributes']['enchantments'][ench].value >= \
                         ENCHANTS[ench]:
-                    return ench
+                    return ench.upper()
         elif name == "PET":
             pet_json = json.loads(nbt_data['tag']['ExtraAttributes']['petInfo'].value)
             rarity = pet_json['tier']
@@ -116,7 +131,7 @@ class AuctionBot(commands.AutoShardedBot):
     # todo Implement separate profit requirements between guilds
     # todo Deal with pet rarity + xp, enchants and HPB
     # todo Handle aliases better
-    # todo Player's money
+    # todo Only show for player's money (web)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -131,25 +146,25 @@ class AuctionBot(commands.AutoShardedBot):
             raise ConfigError("")
         else:
             with open("config.toml") as config_file:
-                config = toml.loads(config_file.read())
+                self.config = toml.loads(config_file.read())
 
-            if not config['api']['hypixel'] or not config['api']['discord']:
+            if not self.config['api']['hypixel'] or not self.config['api']['discord']:
                 raise ConfigError("Ensure you have entered values for api keys")
 
-            db_connection = mysql.connector.connect(host=config['db']['host'],
-                                                    user=config['db']['username'],
-                                                    password=config['db']['password'],
-                                                    database=config['db']['database'])
+            db_connection = mysql.connector.connect(host=self.config['db']['host'],
+                                                    user=self.config['db']['username'],
+                                                    password=self.config['db']['password'],
+                                                    database=self.config['db']['database'])
 
             if not db_connection.is_connected():
                 raise ConfigError("MySQL credentials are incorrect")
 
-            hypixel = config['api']['hypixel']
+            hypixel = self.config['api']['hypixel']
             if json.loads(requests.get(TOKEN_TEST.format(hypixel)).content)['cause'] == "Invalid API key":
                 raise ConfigError("Invalid Hypixel API Key")
 
-            self.grabber = AuctionGrabber(hypixel)
-            self.discord = config['api']['discord']
+            self.grabber = AuctionGrabber(self.config)
+            self.discord = self.config['api']['discord']
             self.db = db_connection
 
     def run(self):
@@ -163,7 +178,10 @@ class AuctionBot(commands.AutoShardedBot):
             if not ready:
                 print(f"Bot is now live on {len(self.guilds)} servers!")
             ready = True
-            await self.grabber.check_flip()
+            for auc in await self.grabber.check_flip():
+                guild: discord.Guild
+                for guild in self.guilds:
+                    await guild.text_channels[0].send(AuctionGrabber.format_uuid(auc["uuid"]))
             await asyncio.sleep(60)
 
 
@@ -185,18 +203,23 @@ async def price_command(ctx: commands.Context, *item):
                               color=0xFF0000)
     else:
         price = client.grabber.min_price[item_name.upper()]
-        link_name = '_'.join([x.capitalize() for x in item_name.split('_')])
+        friendly_name = item_name.replace('_', ' ').title()
+        if item_name.lower() in ENCHANTS:
+            friendly_name = friendly_name + str(ENCHANTS[item_name.lower()]) + " Book"
         embed = discord.Embed(title="💸 {} 💸".format(item_name.replace('_', ' ').title()),
                               description="The current price of {} is: $**{:,d}**".format(
-                                  item_name.replace('_', ' ').title(),
+                                  friendly_name,
                                   int(price)
                               ),
-                              color=0x00FF00,
-                              url=f"https://hypixel-skyblock.fandom.com/wiki/{link_name}")
+                              color=0x00FF00)
+        if client.config['options']["wiki-link"]:
+            async with aiohttp.ClientSession() as session:
+                embed.url = \
+                    json.loads(await (await session.get(WIKI_API.format(friendly_name))).text())['items'][0]['url']
 
     # todo Set image
     embed.set_footer(text="Last updated: ")
-    embed.timestamp = datetime.datetime.fromtimestamp(client.grabber.last_update / 1000.0)
+    embed.timestamp = datetime.datetime.utcfromtimestamp(client.grabber.last_update / 1000.0)
     await ctx.send(embed=embed)
 
 
