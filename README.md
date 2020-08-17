@@ -21,4 +21,4 @@ python3 bot.py
 * Better alias system
 
 ## Contributing
-Contributions are welcome, but the state of the bot is rapidly changing and 
+Contributions are welcome, but the state of the bot is rapidly changing and unlikely to stay the same for a long period.
