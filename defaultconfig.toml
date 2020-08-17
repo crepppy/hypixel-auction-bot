@@ -1,0 +1,9 @@
+[api]
+hypixel = ""
+discord = ""
+
+[db]
+host = ""
+username = ""
+password = ""
+database = ""

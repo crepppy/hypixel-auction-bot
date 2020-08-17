@@ -1,0 +1,5 @@
+# Bot configuration stuffs
+config.toml
+
+# Python
+__pycache__/
