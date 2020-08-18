@@ -12,3 +12,5 @@ database = ""
 wiki-link = false
 min-time = 500
 min-profit = 200_000
+add-recombobulator = false
+use-custom-protocol = false  # Leave this false unless you know what you are doing

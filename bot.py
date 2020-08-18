@@ -7,6 +7,8 @@ import pathlib
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import List
 
 import aiohttp
 import discord
@@ -18,13 +20,25 @@ from discord.ext import commands
 
 from constants import *
 
-songs = defaultdict(lambda: [])
-
 
 class ConfigError(Exception):
     def __init__(self, message):
         print("*----- Please configure the bot in 'config.toml' before running -----*")
         print(message)
+
+
+@dataclass
+class Auction:
+    name: str
+    price: int
+    value: int
+    extra_value: int
+    id: str
+    json_object: json
+
+    def time_ending(self):
+        end_seconds = self.json_object['end'] / 1000 - time.time()
+        return "{:d}m {:d}s".format(int(end_seconds // 60), int(end_seconds % 60))
 
 
 class AuctionGrabber:
@@ -36,6 +50,7 @@ class AuctionGrabber:
         self.key = self.config['api']['hypixel']
         self.min_price = defaultdict(lambda: 0)
         self.auctions = []
+        self.notified = []
         self.prices = defaultdict(lambda: [])
         self.run_counter = 5
         self.last_update = 0
@@ -44,14 +59,22 @@ class AuctionGrabber:
         tasks = [self.get_page(i, session) for i in range(max_page + 1)]
         auc = [a for nested in await asyncio.gather(*tasks) for a in nested]
         if self.run_counter == 5:
-            self.min_price['RECOMBOBULATOR_3000'] = \
-                json.loads(await (await session.get(BAZAAR_ENDPOINT.format(self.key))).text())['products'][
-                    'RECOMBOBULATOR_3000'][
-                    'sell_summary'][0]['pricePerUnit']
+            for price in await self.get_bazaar(session, "RECOMBOBULATOR_3000", "HOT_POTATO_BOOK", "FUMING_POTATO_BOOK"):
+                self.min_price[price[0]] = price[1]
             for item, i_price in self.prices.items():
-                i_price = sorted(i_price)[:5]
-                self.min_price[item] = i_price[len(i_price) // 2 - (0 if len(i_price) % 2 == 1 else 1)]
+                # i_price = sorted(i_price)[:5]
+                # self.min_price[item] = i_price[len(i_price) // 2 - (0 if len(i_price) % 2 == 1 else 1)]
+                self.min_price[item] = min(i_price)
         return auc
+
+    async def get_bazaar(self, session, *items) -> list:
+        async def get_bazaar_tuple(j, prod):
+            return (prod, j['products'][prod][
+                'sell_summary'][0]['pricePerUnit'])
+
+        tasks = [get_bazaar_tuple(json.loads(await (await session.get(BAZAAR_ENDPOINT.format(self.key))).text()), prod)
+                 for prod in items]
+        return [p for p in await asyncio.gather(*tasks)]
 
     async def receive_auctions(self):
         async with aiohttp.ClientSession() as session:
@@ -83,18 +106,53 @@ class AuctionGrabber:
             for k, v in page_prices.items():
                 self.prices[k].append(min(v))
         return [auc for auc in auctions if
-                auc['start'] > self.last_update and (time.time() + 30) * 1000 < auc['end'] < (
-                        time.time() + self.config['options']['min-time']) * 1000]
+                auc['uuid'] not in self.notified and ((time.time() + 30) * 1000 < auc['end'] < (
+                        time.time() + self.config['options']['min-time']) * 1000) or ('bin' in auc and auc['bin'])]
 
-    async def check_flip(self) -> list:
+    async def check_flip(self) -> List[Auction]:
         flips = []
+        j = json.loads(requests.get(PROFILE_ENDPOINT.format(self.key, "13283977ac354d92b950bc1fda73081d")).content)
+        max_price = j['profile']['banking']['balance'] + j['profile']['members']['36e418428cce45ee878d82e2be986d49'][
+            'coin_purse']
         for item in self.auctions:
             price = item['starting_bid'] if item['starting_bid'] > item['highest_bid_amount'] else item[
                 'highest_bid_amount']
-            nbt_data, _, count = AuctionGrabber.decode_item(item['item_bytes'])
+            if price > max_price:
+                continue
+            nbt_data, raw_name, count = AuctionGrabber.decode_item(item['item_bytes'])
             name = AuctionGrabber.get_name(nbt_data)
+
+            # Modify price depending on other enchants
+            extra_attributes = nbt_data['tag']['ExtraAttributes']
+            value = 0
+            if 'hot_potato_count' in extra_attributes:
+                hpb_count = extra_attributes['hot_potato_count'].value
+                if hpb_count > 10:
+                    value += self.min_price['HOT_POTATO_BOOK'] * 10 + (hpb_count - 10) * self.min_price[
+                        'FUMING_POTATO_BOOK']
+
+            if self.config['options']['add-recombobulator'] and 'rarity_upgrades' in extra_attributes:
+                value += self.min_price['RECOMBOBULATOR_3000']
+
+            # Don't increase the value of enchants on dungeon items (can spawn with them)
+            # or enchanted books since their enchant worth is already set
+            if 'enchantments' in extra_attributes and not raw_name == "ENCHANTED_BOOK" and (
+                    not extra_attributes['originTag'] == "UNKNOWN" and 'DUNGEON' not in nbt_data['item_lore']):
+                for enchant in extra_attributes['enchantments'].keys():
+                    if enchant in ENCHANTS and ENCHANTS[enchant] <= extra_attributes['enchantments'][enchant].value:
+                        if enchant == "dragon_hunter" or enchant.startswith("ultimate"):
+                            # base 2 multiplication
+                            value += 2 ** (extra_attributes['enchantments'][enchant].value - 1)
+                        else:
+                            value += self.min_price[enchant.upper()]
+
+            auction_obj = Auction(id=AuctionGrabber.format_uuid(item['uuid']), name=name, price=price,
+                                  extra_value=value, json_object=item,
+                                  value=self.min_price[name] + value * PERCENTAGE_VALUE)
+            price -= value * PERCENTAGE_VALUE  # Value of extras is decreased once added
             if price < self.min_price[name] - self.config['options']['min-profit']:
-                flips.append(item)
+                flips.append(auction_obj)
+                self.notified.append(auction_obj.json_object['uuid'])
             pass
         return flips
 
@@ -129,8 +187,10 @@ class AuctionGrabber:
 
 class AuctionBot(commands.AutoShardedBot):
     # todo Implement separate profit requirements between guilds
-    # todo Deal with pet rarity + xp, enchants and HPB
+    # todo Deal with pet xp
+    # todo Deal with fabled / reforge stones
     # todo Handle aliases better
+    # todo Move check flip into page loading to save time waiting for all endpoints
     # todo Only show for player's money (web)
 
     def __init__(self, *args, **kwargs):
@@ -179,9 +239,24 @@ class AuctionBot(commands.AutoShardedBot):
                 print(f"Bot is now live on {len(self.guilds)} servers!")
             ready = True
             for auc in await self.grabber.check_flip():
-                guild: discord.Guild
-                for guild in self.guilds:
-                    await guild.text_channels[0].send(AuctionGrabber.format_uuid(auc["uuid"]))
+                embed = discord.Embed(title=auc.json_object['item_name'],
+                                      # description=re.sub(r"§[A-Fa-f0-9]", "", auc.json_object['item_lore']),
+                                      colour=0x00FF00)
+                embed.add_field(name="Current Price:", value="${:,d}".format(int(auc.price)), inline=True)
+                embed.add_field(name="Estimated Value:", value="${:,d}".format(int(auc.value)), inline=True)
+                embed.add_field(name="Projected Profit", value="${:,d}".format(int(auc.value - auc.price)),
+                                inline=False)
+                embed.add_field(name="Time Remaining", value="{}".format(auc.time_ending()), inline=False)
+                embed.add_field(name="ID", value="{}".format(auc.id), inline=False)
+                embed.set_footer(text="The value of things added decrease by {:d}% once added to an item".format(
+                    int(PERCENTAGE_VALUE * 100)))
+
+                if self.config['options']['use-custom-protocol']:
+                    # Custom Protocol: only currently works locally with registry entry + c++ application
+                    embed.url = "https://skyblock.jack-chapman.com/" + auc.id
+
+                await self.get_user(139068524105564161).send(embed=embed)
+            print("Updated! " + str(len(self.grabber.auctions)))
             await asyncio.sleep(60)
 
 

@@ -1,5 +1,8 @@
 # Bot configuration stuffs
 config.toml
 
+# Custom URL Protocol Handler for opening the game
+ProtocolHandler.exe
+
 # Python
 __pycache__/
