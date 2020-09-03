@@ -9,15 +9,12 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List
-
 import aiohttp
 import discord
-import mysql.connector
 import nbt.nbt as nbt
 import requests
 import toml
 from discord.ext import commands
-
 from constants import *
 
 
@@ -34,6 +31,7 @@ class Auction:
     value: int
     extra_value: int
     id: str
+    image: str
     json_object: json
 
     def time_ending(self):
@@ -65,6 +63,9 @@ class AuctionGrabber:
                 # i_price = sorted(i_price)[:5]
                 # self.min_price[item] = i_price[len(i_price) // 2 - (0 if len(i_price) % 2 == 1 else 1)]
                 self.min_price[item] = min(i_price)
+
+            # Set default prices for items that won't fluctuate as to not give fake values
+            self.min_price["DRAGON_SLAYER"] = 1_000_000
         return auc
 
     async def get_bazaar(self, session, *items) -> list:
@@ -87,7 +88,14 @@ class AuctionGrabber:
         self.run_counter = 0 if self.run_counter == 5 else self.run_counter + 1
 
     async def get_page(self, page: int, session: aiohttp.ClientSession) -> json:
-        auctions = json.loads(await (await session.get(AUCTION_ENDPOINT.format(self.key, page))).text())['auctions']
+        try:
+            auctions_json = json.loads(await (await session.get(AUCTION_ENDPOINT.format(self.key, page))).text())
+            if 'auctions' in auctions_json:
+                auctions = auctions_json['auctions']
+            else:
+                return []
+        except aiohttp.ServerDisconnectedError:
+            return []
         if self.run_counter == 5:
             page_prices = defaultdict(lambda: [])
             for auction in auctions:
@@ -95,28 +103,27 @@ class AuctionGrabber:
                     continue
                 nbt_data, _, count = self.decode_item(auction['item_bytes'])
 
-                # todo images (from texture pack or head)
-                # if name not in self.images and 'SkullOwner' in nbt_data['tag'].keys():
-                #     # Item is a head
-                #     base64_texture = nbt_data['tag']['SkullOwner']['Properties']['textures'][0]['Value'].value
-                #     self.images[name] = json.loads(str(base64.b64decode(base64_texture).decode()))['SKIN']['url']
-
                 name = AuctionGrabber.get_name(nbt_data)
                 page_prices[name].append(auction['starting_bid'] / count)
             for k, v in page_prices.items():
                 self.prices[k].append(min(v))
         return [auc for auc in auctions if
-                auc['uuid'] not in self.notified and ((time.time() + 30) * 1000 < auc['end'] < (
-                        time.time() + self.config['options']['min-time']) * 1000) or ('bin' in auc and auc['bin'])]
+                auc['uuid'] not in self.notified and (((time.time() + 30) * 1000 < auc['end'] < (
+                        time.time() + self.config['options']['min-time']) * 1000) or ('bin' in auc and auc['bin']))]
 
     async def check_flip(self) -> List[Auction]:
         flips = []
-        j = json.loads(requests.get(PROFILE_ENDPOINT.format(self.key, "13283977ac354d92b950bc1fda73081d")).content)
-        max_price = j['profile']['banking']['balance'] + j['profile']['members']['36e418428cce45ee878d82e2be986d49'][
-            'coin_purse']
+        # j = json.loads(requests.get(PROFILE_ENDPOINT.format(self.key, "13283977ac354d92b950bc1fda73081d")).content)
+        j = json.loads(requests.get(PROFILE_ENDPOINT.format(self.key, "ee4dfc679c4245c8a34e89cfa6c02d62")).content)
+
+        # max_price = j['profile']['banking']['balance'] + j['profile']['members']['36e418428cce45ee878d82e2be986d49'][
+        #     'coin_purse']
+        # max_price = j['profile']['members']['36e418428cce45ee878d82e2be986d49'][
+        #     'coin_purse']
+        max_price = sum([int(j['profile']['members'][bal]['coin_purse']) for bal in j['profile']['members']])
         for item in self.auctions:
-            price = item['starting_bid'] if item['starting_bid'] > item['highest_bid_amount'] else item[
-                'highest_bid_amount']
+            price = item['starting_bid'] if item['starting_bid'] > item['highest_bid_amount'] else \
+                item['highest_bid_amount'] * 1.15  # Factor in your bid
             if price > max_price:
                 continue
             nbt_data, raw_name, count = AuctionGrabber.decode_item(item['item_bytes'])
@@ -134,20 +141,31 @@ class AuctionGrabber:
             if self.config['options']['add-recombobulator'] and 'rarity_upgrades' in extra_attributes:
                 value += self.min_price['RECOMBOBULATOR_3000']
 
+            if 'wood_singularity_count' in extra_attributes and extra_attributes['wood_singularity_count'] == 1:
+                value += self.min_price['WOOD_SINGULARITY']
+
             # Don't increase the value of enchants on dungeon items (can spawn with them)
             # or enchanted books since their enchant worth is already set
-            if 'enchantments' in extra_attributes and not raw_name == "ENCHANTED_BOOK" and (
-                    not extra_attributes['originTag'] == "UNKNOWN" and 'DUNGEON' not in nbt_data['item_lore']):
-                for enchant in extra_attributes['enchantments'].keys():
-                    if enchant in ENCHANTS and ENCHANTS[enchant] <= extra_attributes['enchantments'][enchant].value:
-                        if enchant == "dragon_hunter" or enchant.startswith("ultimate"):
+            if 'enchantments' in extra_attributes and not raw_name == "ENCHANTED_BOOK" and \
+                    (('originTag' in extra_attributes and not extra_attributes['originTag'].value == "UNKNOWN")
+                     and 'DUNGEON' not in item['item_lore']):
+                for ench in extra_attributes['enchantments'].keys():
+                    if ench in ENCHANTS and ENCHANTS[ench] <= extra_attributes['enchantments'][ench].value:
+                        if ench == "dragon_hunter" or ench.startswith("ultimate"):
                             # base 2 multiplication
-                            value += 2 ** (extra_attributes['enchantments'][enchant].value - 1)
+                            value += 2 ** (extra_attributes['enchantments'][ench].value - 1) \
+                                     * self.min_price[ench.upper()]
                         else:
-                            value += self.min_price[enchant.upper()]
+                            value += self.min_price[ench.upper()]
+
+            image = 'https://sky.lea.moe/item/' + raw_name
+            if 'SkullOwner' in nbt_data['tag']:
+                head_json = json.loads(base64.b64decode(
+                    nbt_data['tag']['SkullOwner']['Properties']['textures'][0]['Value'].value + "===").decode("utf-8"))
+                image = 'https://sky.lea.moe/head/' + head_json['textures']['SKIN']['url'].split("texture/", 1)[1]
 
             auction_obj = Auction(id=AuctionGrabber.format_uuid(item['uuid']), name=name, price=price,
-                                  extra_value=value, json_object=item,
+                                  extra_value=value, json_object=item, image=image,
                                   value=self.min_price[name] + value * PERCENTAGE_VALUE)
             price -= value * PERCENTAGE_VALUE  # Value of extras is decreased once added
             if price < self.min_price[name] - self.config['options']['min-profit']:
@@ -211,13 +229,14 @@ class AuctionBot(commands.AutoShardedBot):
             if not self.config['api']['hypixel'] or not self.config['api']['discord']:
                 raise ConfigError("Ensure you have entered values for api keys")
 
-            db_connection = mysql.connector.connect(host=self.config['db']['host'],
-                                                    user=self.config['db']['username'],
-                                                    password=self.config['db']['password'],
-                                                    database=self.config['db']['database'])
-
-            if not db_connection.is_connected():
-                raise ConfigError("MySQL credentials are incorrect")
+            # db_connection = mysql.connector.connect(host=self.config['db']['host'],
+            #                                         user=self.config['db']['username'],
+            #                                         password=self.config['db']['password'],
+            #                                         database=self.config['db']['database'])
+            #
+            # if not db_connection.is_connected():
+            #     raise ConfigError("MySQL credentials are incorrect")
+            # self.db = db_connection
 
             hypixel = self.config['api']['hypixel']
             if json.loads(requests.get(TOKEN_TEST.format(hypixel)).content)['cause'] == "Invalid API key":
@@ -225,7 +244,6 @@ class AuctionBot(commands.AutoShardedBot):
 
             self.grabber = AuctionGrabber(self.config)
             self.discord = self.config['api']['discord']
-            self.db = db_connection
 
     def run(self):
         return super().run(self.discord)
@@ -248,14 +266,16 @@ class AuctionBot(commands.AutoShardedBot):
                                 inline=False)
                 embed.add_field(name="Time Remaining", value="{}".format(auc.time_ending()), inline=False)
                 embed.add_field(name="ID", value="{}".format(auc.id), inline=False)
-                embed.set_footer(text="The value of things added decrease by {:d}% once added to an item".format(
+                embed.set_footer(text="The value of things added decrease by {:d}% once added to an item.".format(
                     int(PERCENTAGE_VALUE * 100)))
+                embed.set_thumbnail(url=auc.image)
 
                 if self.config['options']['use-custom-protocol']:
                     # Custom Protocol: only currently works locally with registry entry + c++ application
                     embed.url = "https://skyblock.jack-chapman.com/" + auc.id
 
-                await self.get_user(139068524105564161).send(embed=embed)
+                await self.get_guild(749752189563437057).get_channel(749752189563437060).send(embed=embed)
+
             print("Updated! " + str(len(self.grabber.auctions)))
             await asyncio.sleep(60)
 

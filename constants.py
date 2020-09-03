@@ -3,6 +3,13 @@ ENCHANTS = {
     'luck': 6,
     'ultimate_combo': 1,
     'ultimate_wise': 1,
+    'ultimate_bank': 1,
+    'ultimate_last_stand': 1,
+    'ultimate_no_pain_no_gain': 1,
+    'ultimate_rend': 1,
+    'ultimate_jerry': 1,
+    'ultimate_wisdom': 1,
+    'dragon_slayer': 1,
     'critical': 6,
     'looting': 4,
     'ender_slayer': 6,
@@ -27,7 +34,7 @@ ENCHANTS = {
     'spiked_hook': 6,
 }
 
-PERCENTAGE_VALUE = .8  # The cost of extra attributes are decreased once added to an item
+PERCENTAGE_VALUE = .85    # The cost multiplier of extra attributes once added to an item
 AUCTION_ENDPOINT = r'https://api.hypixel.net/skyblock/auctions?key={}&page={}'
 BAZAAR_ENDPOINT = r'https://api.hypixel.net/skyblock/bazaar?key={}'
 PROFILE_ENDPOINT = r'https://api.hypixel.net/skyblock/profile?key={}&profile={}'
