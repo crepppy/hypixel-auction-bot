@@ -34,6 +34,22 @@ ENCHANTS = {
     'spiked_hook': 6,
 }
 
+IGNORE = [
+    'DRAGON_SLAYER',
+]  # Items to not update price for
+
+DEFAULT_CONFIG = """
+[api]
+hypixel = ""
+
+[db]
+host = ""
+port = 3306
+username = ""
+password = ""
+database = ""
+"""
+
 PERCENTAGE_VALUE = .85    # The cost multiplier of extra attributes once added to an item
 AUCTION_ENDPOINT = r'https://api.hypixel.net/skyblock/auctions?key={}&page={}'
 BAZAAR_ENDPOINT = r'https://api.hypixel.net/skyblock/bazaar?key={}'
