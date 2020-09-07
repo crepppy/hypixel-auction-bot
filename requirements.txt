@@ -2,7 +2,6 @@ aiohttp==3.6.2
 async-timeout==3.0.1
 attrs==19.3.0
 chardet==3.0.4
-discord.py==1.4.1
 idna==2.10
 multidict==4.7.6
 NBT==1.5.0
@@ -10,5 +9,5 @@ requests==2.24.0
 toml==0.10.1
 urllib3==1.25.10
 yarl==1.5.1
-aiomysql==0.0.20
 async_lru==1.0.2
+aiocache~=0.11.1

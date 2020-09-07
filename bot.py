@@ -53,7 +53,7 @@ class Auction:
     @staticmethod
     def get_name(nbt_data):
         name = nbt_data['tag']['ExtraAttributes']['id'].value
-        if name == "ENCHANTED_BOOK":
+        if name == "ENCHANTED_BOOK" and 'enchantments' in nbt_data['tag']['ExtraAttributes']:
             # Track individual book prices
             if len(nbt_data['tag']['ExtraAttributes']['enchantments'].keys()) == 1:
                 ench = nbt_data['tag']['ExtraAttributes']['enchantments'].keys()[0]
@@ -97,7 +97,7 @@ class AuctionGrabber(Thread):
                                                    user=self.config['db']['username'],
                                                    password=self.config['db']['password'],
                                                    db=self.config['db']['database'],
-                                                   loop=self.loop, minsize=30, maxsize=60)
+                                                   loop=self.loop, minsize=60, maxsize=100, autocommit=True)
         # raise ConfigError("MySQL credentials are incorrect")
         self.db = db_connection
         async with self.db.acquire() as conn:
@@ -110,48 +110,49 @@ class AuctionGrabber(Thread):
                                   "value FLOAT NOT NULL,"
                                   "ending TIMESTAMP NOT NULL,"
                                   "bin BOOL NOT NULL,"
-                                  "bytes TEXT NOT NULL)")
+                                  "bytes TEXT NOT NULL) ENGINE=INNODB")
 
                 await cur.execute("CREATE TABLE IF NOT EXISTS price("
                                   "item_name VARCHAR(255) NOT NULL,"
                                   "price FLOAT NOT NULL,"
                                   "time_checked DATETIME NOT NULL DEFAULT NOW(),"
-                                  "PRIMARY KEY (item_name, time_checked))")
+                                  "PRIMARY KEY (item_name, time_checked)) ENGINE=INNODB")
 
                 await cur.execute("CREATE TABLE IF NOT EXISTS aliases("
                                   "item_name VARCHAR(255) PRIMARY KEY,"
-                                  "alias FLOAT NOT NULL)")
+                                  "alias FLOAT NOT NULL) ENGINE=INNODB")
 
     def run(self):
         while True:
+            start = time.time()
             self.loop.run_until_complete(self.receive_auctions())
+            print(time.time() - start)
             time.sleep(60)
 
     async def get_pages(self, max_page, session):
         tasks = [self.get_page(i, session) for i in range(max_page + 1)]
-        auc = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
+        async with self.db.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM auctions WHERE ending < NOW()")
+
         print("Gathered")
-        if self.run_counter == 5 and auc:
+        if self.run_counter == 5:
             bazaar_tasks = [self.get_bazaar(session, item) for item in
                             ["RECOMBOBULATOR_3000", "HOT_POTATO_BOOK", "FUMING_POTATO_BOOK"]]
-
-            prices = {tup[0]: tup[1] for tup in await asyncio.gather(*bazaar_tasks)}
-            for d in auc:
-                for k, v in d.items():
-                    if k not in prices or prices[k] > v:
-                        prices[k] = v
+            await asyncio.gather(*bazaar_tasks)
             async with self.db.acquire() as conn:
                 async with conn.cursor() as cur:
-                    for item_name, price in prices.keys():
-                        if item_name.upper() in IGNORE:
-                            continue
-                        await cur.execute("INSERT INTO price(item_name, price) VALUES (%s, %s)", (item_name, price))
+                    await cur.execute("INSERT INTO price(item_name, price)"
+                                      "SELECT item_name, MIN(price) min_price FROM auctions"
+                                      " WHERE bin = 1 GROUP BY item_name")
 
-        return auc
-
-    async def get_bazaar(self, session, item) -> tuple:
+    async def get_bazaar(self, session, item):
         prod_json = json.loads(await (await session.get(BAZAAR_ENDPOINT.format(self.key))).text())
-        return item, prod_json['products'][item]['sell_summary'][0]['pricePerUnit']
+        async with self.db.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("INSERT INTO price(item_name, price) VALUES (%s, %s)",
+                                  (item, prod_json['products'][item]['sell_summary'][0]['pricePerUnit']))
 
     async def receive_auctions(self):
         async with aiohttp.ClientSession() as session:
@@ -167,8 +168,8 @@ class AuctionGrabber(Thread):
         self.run_counter = 0 if self.run_counter == 5 else self.run_counter + 1
 
     async def insert_auction(self, auc):
-        if auc['end'] < (time.time() * 1000):
-            return
+        # if auc['end'] < (time.time() * 1000):
+        #     return
         nbt_data, *_ = Auction.decode_item(auc['item_bytes'])
         value = await self.calculate_worth(nbt_data)
         price = max(auc['starting_bid'], auc['highest_bid_amount'])
@@ -180,42 +181,25 @@ class AuctionGrabber(Thread):
         if self.db is not None:
             self.db.close()
 
-    async def get_page(self, page: int, session: aiohttp.ClientSession) -> dict:
+    async def get_page(self, page: int, session: aiohttp.ClientSession):
         print("getting page", page)
         try:
             auctions_json = json.loads(await (await session.get(AUCTION_ENDPOINT.format(self.key, page))).text())
             if 'auctions' not in auctions_json:
-                return {}
+                return
             auctions = auctions_json['auctions']
             tasks = [self.insert_auction(auc) for auc in auctions]
+            data = await asyncio.gather(*tasks)
             async with self.db.acquire() as conn:
                 async with conn.cursor() as cur:
-                    data = await asyncio.gather(*tasks)
                     await cur.executemany("INSERT INTO auctions VALUES (%s, %s, %s, %s, %s, FROM_UNIXTIME(%s), %s, %s)"
                                           " ON DUPLICATE KEY UPDATE price=VALUES(price), ending=VALUES(ending)",
                                           data)
-                    await conn.commit()
 
             print("Page gotten", page)
             # await cur.execute("DELETE FROM auctions WHERE ending < NOW()")
-
-            if self.run_counter == 5:
-                page_prices = defaultdict(lambda: [])
-                for auction in auctions:
-                    # todo improve
-                    if 'bin' not in auction or auction['bin'] is False or auction['end'] < time.time() * 1000:
-                        continue
-                    nbt_data, _, count = Auction.decode_item(auction['item_bytes'])
-
-                    name = Auction.get_name(nbt_data)
-                    page_prices[name].append(auction['starting_bid'] / count)
-                d = {k: min(v) for k, v in page_prices.items()}
-                print(d)
-                return d
         except aiohttp.ServerDisconnectedError:
-            return {}
-
-        return {}
+            pass
         # return [auc for auc in auctions if
         #         auc['uuid'] not in self.notified and (((time.time() + 30) * 1000 < auc['end'] < (
         #                 time.time() + self.config['options']['min-time']) * 1000) or ('bin' in auc and auc['bin']))]
