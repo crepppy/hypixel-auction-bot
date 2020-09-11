@@ -5,19 +5,23 @@ import json
 import pathlib
 import sys
 import time
-from collections import defaultdict
+from quart import Quart
+import quart
 from dataclasses import dataclass
 from threading import Thread
-from typing import List
-
+# import uvloop
 from aiocache import cached
 import aiohttp
 import aiomysql
+from aiomysql import DictCursor
 import nbt.nbt as nbt
 import requests
 import toml
 
 from constants import *
+
+
+# asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 class ConfigError(Exception):
@@ -69,15 +73,42 @@ class Auction:
         return name
 
 
-class AuctionGrabber(Thread):
-    with open("alias.json", "r") as alias_file:
-        aliases = json.loads(alias_file.read())
+async def configure_database():
+    async with db.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("CREATE TABLE IF NOT EXISTS auctions("
+                              "id VARCHAR(36) PRIMARY KEY,"
+                              "item_name VARCHAR(255) NOT NULL,"
+                              "price FLOAT NOT NULL,"
+                              "seller VARCHAR(36) NOT NULL,"
+                              "extra_value FLOAT NOT NULL,"
+                              "ending TIMESTAMP NOT NULL,"
+                              "bin BOOL NOT NULL,"
+                              "bytes TEXT NOT NULL) ENGINE=INNODB")
 
+            await cur.execute("CREATE TABLE IF NOT EXISTS price("
+                              "item_name VARCHAR(255) NOT NULL,"
+                              "price FLOAT NOT NULL DEFAULT 0,"
+                              "time_checked DATETIME NOT NULL DEFAULT NOW(),"
+                              "PRIMARY KEY (item_name, time_checked)) ENGINE=INNODB")
+
+            await cur.execute("CREATE TABLE IF NOT EXISTS aliases("
+                              "item_name VARCHAR(255) PRIMARY KEY,"
+                              "alias FLOAT NOT NULL) ENGINE=INNODB")
+
+            await cur.execute("DELIMITER $$ CREATE FUNCTION IF NOT EXISTS LatestPrice(i_name VARCHAR(255))"
+                              "RETURNS FLOAT BEGIN "
+                              "RETURN (SELECT price FROM price INNER JOIN ("
+                              "  SELECT item_name, MAX(time_checked) AS recent FROM price GROUP BY item_name) p_tbl"
+                              "  ON price.item_name = p_tbl.item_name AND time_checked = p_tbl.recent "
+                              "WHERE price.item_name=i_name); END; $$ DELIMITER ;")
+
+
+class AuctionGrabber(Thread):
     def __init__(self, config, event_loop):
         super().__init__()
         self.config = config
         self.key = self.config['api']['hypixel']
-        self.db = None
         self.loop: asyncio.AbstractEventLoop = event_loop
         self.run_counter = 5
         self.last_update = 0
@@ -85,54 +116,23 @@ class AuctionGrabber(Thread):
         if not config['api']['hypixel']:
             raise ConfigError("Ensure you have entered values for api keys")
 
-        loop.run_until_complete(self.configure_database())
+        loop.run_until_complete(configure_database())
 
         hypixel = self.config['api']['hypixel']
         if requests.get(TOKEN_TEST.format(hypixel)).status_code != 404:
             raise ConfigError("Invalid Hypixel API Key or the API is currently down")
-
-    async def configure_database(self):
-        db_connection = await aiomysql.create_pool(host=self.config['db']['host'],
-                                                   port=self.config['db']['port'],
-                                                   user=self.config['db']['username'],
-                                                   password=self.config['db']['password'],
-                                                   db=self.config['db']['database'],
-                                                   loop=self.loop, minsize=60, maxsize=100, autocommit=True)
-        # raise ConfigError("MySQL credentials are incorrect")
-        self.db = db_connection
-        async with self.db.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("CREATE TABLE IF NOT EXISTS auctions("
-                                  "id VARCHAR(36) PRIMARY KEY,"
-                                  "item_name VARCHAR(255) NOT NULL,"
-                                  "price FLOAT NOT NULL,"
-                                  "seller VARCHAR(36) NOT NULL,"
-                                  "value FLOAT NOT NULL,"
-                                  "ending TIMESTAMP NOT NULL,"
-                                  "bin BOOL NOT NULL,"
-                                  "bytes TEXT NOT NULL) ENGINE=INNODB")
-
-                await cur.execute("CREATE TABLE IF NOT EXISTS price("
-                                  "item_name VARCHAR(255) NOT NULL,"
-                                  "price FLOAT NOT NULL,"
-                                  "time_checked DATETIME NOT NULL DEFAULT NOW(),"
-                                  "PRIMARY KEY (item_name, time_checked)) ENGINE=INNODB")
-
-                await cur.execute("CREATE TABLE IF NOT EXISTS aliases("
-                                  "item_name VARCHAR(255) PRIMARY KEY,"
-                                  "alias FLOAT NOT NULL) ENGINE=INNODB")
 
     def run(self):
         while True:
             start = time.time()
             self.loop.run_until_complete(self.receive_auctions())
             print(time.time() - start)
-            time.sleep(60)
+            time.sleep(60 - (time.time() - self.last_update // 1000))
 
     async def get_pages(self, max_page, session):
         tasks = [self.get_page(i, session) for i in range(max_page + 1)]
         await asyncio.gather(*tasks)
-        async with self.db.acquire() as conn:
+        async with db.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM auctions WHERE ending < NOW()")
 
@@ -141,7 +141,7 @@ class AuctionGrabber(Thread):
             bazaar_tasks = [self.get_bazaar(session, item) for item in
                             ["RECOMBOBULATOR_3000", "HOT_POTATO_BOOK", "FUMING_POTATO_BOOK"]]
             await asyncio.gather(*bazaar_tasks)
-            async with self.db.acquire() as conn:
+            async with db.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("INSERT INTO price(item_name, price)"
                                       "SELECT item_name, MIN(price) min_price FROM auctions"
@@ -149,7 +149,7 @@ class AuctionGrabber(Thread):
 
     async def get_bazaar(self, session, item):
         prod_json = json.loads(await (await session.get(BAZAAR_ENDPOINT.format(self.key))).text())
-        async with self.db.acquire() as conn:
+        async with db.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("INSERT INTO price(item_name, price) VALUES (%s, %s)",
                                   (item, prod_json['products'][item]['sell_summary'][0]['pricePerUnit']))
@@ -167,20 +167,6 @@ class AuctionGrabber(Thread):
         self.last_update = page0['lastUpdated']
         self.run_counter = 0 if self.run_counter == 5 else self.run_counter + 1
 
-    async def insert_auction(self, auc):
-        # if auc['end'] < (time.time() * 1000):
-        #     return
-        nbt_data, *_ = Auction.decode_item(auc['item_bytes'])
-        value = await self.calculate_worth(nbt_data)
-        price = max(auc['starting_bid'], auc['highest_bid_amount'])
-        timestamp = auc['end'] // 1000
-        return (auc['uuid'], Auction.get_name(nbt_data), price, auc['auctioneer'], value, timestamp,
-                'bin' in auc and auc['bin'], auc['item_bytes'])
-
-    def __del__(self):
-        if self.db is not None:
-            self.db.close()
-
     async def get_page(self, page: int, session: aiohttp.ClientSession):
         print("getting page", page)
         try:
@@ -188,9 +174,15 @@ class AuctionGrabber(Thread):
             if 'auctions' not in auctions_json:
                 return
             auctions = auctions_json['auctions']
-            tasks = [self.insert_auction(auc) for auc in auctions]
-            data = await asyncio.gather(*tasks)
-            async with self.db.acquire() as conn:
+            data = []
+            for auc in auctions:
+                nbt_data, *_ = Auction.decode_item(auc['item_bytes'])
+                value = await self.calculate_worth(nbt_data)
+                price = max(auc['starting_bid'], auc['highest_bid_amount'])
+                timestamp = auc['end'] // 1000
+                data.append((auc['uuid'], Auction.get_name(nbt_data), price, auc['auctioneer'], value, timestamp,
+                             'bin' in auc and auc['bin'], auc['item_bytes']))
+            async with db.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.executemany("INSERT INTO auctions VALUES (%s, %s, %s, %s, %s, FROM_UNIXTIME(%s), %s, %s)"
                                           " ON DUPLICATE KEY UPDATE price=VALUES(price), ending=VALUES(ending)",
@@ -200,41 +192,23 @@ class AuctionGrabber(Thread):
             # await cur.execute("DELETE FROM auctions WHERE ending < NOW()")
         except aiohttp.ServerDisconnectedError:
             pass
-        # return [auc for auc in auctions if
-        #         auc['uuid'] not in self.notified and (((time.time() + 30) * 1000 < auc['end'] < (
-        #                 time.time() + self.config['options']['min-time']) * 1000) or ('bin' in auc and auc['bin']))]
 
-    async def check_flip(self) -> List[Auction]:
-        flips = []
-        # j = json.loads(requests.get(PROFILE_ENDPOINT.format(self.key, "13283977ac354d92b950bc1fda73081d")).content)
-        j = json.loads(requests.get(PROFILE_ENDPOINT.format(self.key, "ee4dfc679c4245c8a34e89cfa6c02d62")).content)
-
-        # max_price = j['profile']['banking']['balance'] + j['profile']['members']['36e418428cce45ee878d82e2be986d49'][
-        #     'coin_purse']
-        # max_price = j['profile']['members']['36e418428cce45ee878d82e2be986d49'][
-        #     'coin_purse']
-        max_price = sum([int(j['profile']['members'][bal]['coin_purse']) for bal in j['profile']['members']])
-        return flips
-
-    @cached(ttl=60)
-    async def get_price(self, item):
-        async with self.db.acquire() as conn:
+    @staticmethod
+    @cached(ttl=300)
+    async def get_price(item):
+        async with db.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT price FROM price INNER JOIN ("
-                                  "  SELECT item_name, MAX(time_checked) AS recent FROM price GROUP BY item_name) p_tbl"
-                                  "  ON price.item_name = p_tbl.item_name AND time_checked = p_tbl.recent "
-                                  "WHERE price.item_name=%s", (item,))
+                await cur.execute("SELECT LatestPrice(%s)", (item,))
                 price = await cur.fetchone()
                 return 0 if price is None else price[0]
 
     async def calculate_worth(self, nbt_data) -> int:
         raw_name = nbt_data['tag']['ExtraAttributes']['id'].value
         # todo handle count
-        name = Auction.get_name(nbt_data)
 
         # Modify price depending on other enchants
         extra_attributes = nbt_data['tag']['ExtraAttributes']
-        value = await self.get_price(name)
+        value = 0
         if 'hot_potato_count' in extra_attributes:
             hpb_count = extra_attributes['hot_potato_count'].value
             if hpb_count > 10:
@@ -277,20 +251,72 @@ class AuctionGrabber(Thread):
 # todo Deal with pet xp
 # todo Deal with fabled / reforge stones
 # todo Handle aliases better
-# todo Move check flip into page loading to save time waiting for all endpoints
-# todo Only show for player's money (web)
+
+path = pathlib.Path("config.toml")
+if not path.exists():
+    with open("config.toml", "a+") as config_file:
+        config_file.write(DEFAULT_CONFIG)
+    print("*----- Please configure the bot in 'config.toml' before running -----*")
+    sys.exit()
+with open("config.toml") as config_file:
+    conf = toml.loads(config_file.read())
+
+loop = asyncio.get_event_loop()
+db = loop.run_until_complete(aiomysql.create_pool(
+    host=conf['db']['host'],
+    port=conf['db']['port'],
+    user=conf['db']['username'],
+    password=conf['db']['password'],
+    db=conf['db']['database'],
+    loop=loop, minsize=60, maxsize=100, autocommit=True))
+
+app = Quart(__name__)
+
+
+@app.route("/flips")
+async def flips():
+    buy = 'bin' in quart.request.args
+    min_profit = quart.request.args.get("profit", default=100_000, type=int)
+    max_money = quart.request.args.get("money")
+    async with db.acquire() as conn:
+        async with conn.cursor(DictCursor) as cur:
+            await cur.execute(
+                "SELECT auctions.id,"
+                "       auctions.item_name,"
+                "       auctions.price,"
+                "       auctions.seller,"
+                "       auctions.ending,"
+                "       auctions.bin,"
+                "       auctions.bytes,"
+                "       extra_value + p.latest_price AS total_value,"
+                "       auctions.price - (extra_value + p.latest_price) AS profit "
+                "FROM auctions "
+                "  LEFT JOIN (SELECT LatestPrice(item_name) AS latest_price, auctions.id FROM auctions)"
+                "  p ON p.id = auctions.id "
+                "WHERE (auctions.price < %s OR 1=%s) AND extra_value + p.latest_price + %s > auctions.price",
+                (max_money, max_money is None, min_profit))  # todo bins
+            return {'last_update': app.config['grabber'].last_update, 'auctions': await cur.fetchall()}
+
+
+@app.route("/price/<item>")  # todo make into template
+async def get_price(item):
+    async with db.acquire() as conn:
+        async with conn.cursor() as cur:
+            return {'item': item,
+                    'price': await cur.execute("SELECT LatestPrice(%s)", (item,))[0],
+                    'last_update': app.config['grabber'].last_update}  # todo handle alias
+
+
+@app.route("/prices/<item>")
+async def get_price(item):
+    async with db.acquire() as conn:
+        async with conn.cursor(DictCursor) as cur:
+            return {'item': item,
+                    'prices': await cur.execute("SELECT price, time_checked FROM price WHERE item_name=%s", (item,))[0]}
 
 
 if __name__ == "__main__":
-    path = pathlib.Path("config.toml")
-    if not path.exists():
-        with open("config.toml", "a+") as config_file:
-            config_file.write(DEFAULT_CONFIG)
-        print("*----- Please configure the bot in 'config.toml' before running -----*")
-        sys.exit()
-    with open("config.toml") as config_file:
-        conf = toml.loads(config_file.read())
-
-    loop = asyncio.get_event_loop()
     thread = AuctionGrabber(conf, loop)
     thread.start()
+    app.config['grabber'] = thread
+    app.run(host="127.0.0.1", port=5000, loop=loop)
