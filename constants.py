@@ -56,3 +56,4 @@ BAZAAR_ENDPOINT = r'https://api.hypixel.net/skyblock/bazaar?key={}'
 PROFILE_ENDPOINT = r'https://api.hypixel.net/skyblock/profile?key={}&profile={}'
 TOKEN_TEST = r'https://api.hypixel.net/token?key={}'
 WIKI_API = "https://hypixel-skyblock.fandom.com/api/v1/Search/List?query={}&limit=1"
+CYCLE = 10

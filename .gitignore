@@ -6,3 +6,4 @@ ProtocolHandler.exe
 
 # Python
 __pycache__/
+venv/
