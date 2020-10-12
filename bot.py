@@ -5,7 +5,7 @@ import json
 import pathlib
 import sys
 import time
-from quart import Quart
+from quart import Quart, jsonify
 import quart
 from dataclasses import dataclass
 from threading import Thread
@@ -17,6 +17,11 @@ import nbt.nbt as nbt
 import requests
 import toml
 from constants import *
+
+if sys.platform.startswith("linux"):
+    import uvloop
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 class ConfigError(Exception):
@@ -96,20 +101,22 @@ async def configure_database():
                        IF(price > 1000000, 1.1, 1)
             """)
 
+        await conn.commit()
+
 
 class AuctionGrabber(Thread):
-    def __init__(self, config, event_loop):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.key = self.config['api']['hypixel']
-        self.loop: asyncio.AbstractEventLoop = event_loop
-        self.run_counter = CYCLE
+        self.loop = asyncio.new_event_loop()
+        self.run_counter = CYCLE - 1
         self.last_update = 0
+        self.updating = False
+        self.db = self.loop.run_until_complete(get_db_connection())
 
         if not config['api']['hypixel']:
             raise ConfigError("Ensure you have entered values for api keys")
-
-        loop.run_until_complete(configure_database())
 
         hypixel = self.config['api']['hypixel']
         if requests.get(TOKEN_TEST.format(hypixel)).status_code != 404:
@@ -117,7 +124,11 @@ class AuctionGrabber(Thread):
 
     def run(self):
         while True:
-            self.loop.run_until_complete(self.receive_auctions())
+            self.loop.run_until_complete(self._run())
+
+    async def _run(self):
+        while True:
+            await self.receive_auctions()
             sleep = time.time() - self.last_update // 1000 - 55
             if sleep > 0:
                 time.sleep(sleep)
@@ -131,14 +142,15 @@ class AuctionGrabber(Thread):
             bazaar_tasks = [self.get_bazaar(session, item) for item in
                             ["RECOMBOBULATOR_3000", "HOT_POTATO_BOOK", "FUMING_POTATO_BOOK"]]
             await asyncio.gather(*bazaar_tasks)
-            async with db.acquire() as conn:
+            async with self.db.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("""
                         INSERT INTO price(item_name, price, num_sold)
                         SELECT auctions.item_name, MIN(price) min_price, IFNULL(s.s, 0) as sold
                         FROM auctions
-                                 LEFT JOIN (SELECT item_name, COUNT(price) as s FROM auctions WHERE not(updated = %s)) s
-                                            on auctions.item_name = s.item_name
+                                 LEFT JOIN (SELECT item_name, COUNT(price) as s FROM auctions 
+                                        WHERE not(updated = %s) GROUP BY item_name) s
+                                        on auctions.item_name = s.item_name
                         WHERE buy_it_now = 1 and updated = %s
                         GROUP BY item_name
                     """, (CYCLE, CYCLE))
@@ -150,13 +162,15 @@ class AuctionGrabber(Thread):
 
     async def get_bazaar(self, session, item):
         prod_json = json.loads(await (await session.get(BAZAAR_ENDPOINT.format(self.key))).text())
-        async with db.acquire() as conn:
+        async with self.db.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("INSERT INTO price(item_name, price, num_sold) VALUES (%s, %s, %s)",
                                   (item, prod_json['products'][item]['sell_summary'][0]['pricePerUnit'],
-                                   len(prod_json['products'][item]['sell_summary'])))
+                                   prod_json['products'][item]['quick_status']['sellVolume']))
 
     async def receive_auctions(self):
+        self.run_counter = 0 if self.run_counter == CYCLE else self.run_counter + 1
+        self.updating = True
         async with aiohttp.ClientSession() as session:
             resp = await session.get(AUCTION_ENDPOINT.format(self.key, 0))
             if resp.status != 200:
@@ -167,7 +181,7 @@ class AuctionGrabber(Thread):
             # AuctionGrabber.get_price.cache_clear()
             await self.get_pages(page0['totalPages'], session)
         self.last_update = page0['lastUpdated']
-        self.run_counter = 0 if self.run_counter == CYCLE else self.run_counter + 1
+        self.updating = False
 
     async def get_page(self, page: int, session: aiohttp.ClientSession):
         print("getting page", page)
@@ -178,13 +192,15 @@ class AuctionGrabber(Thread):
             auctions = auctions_json['auctions']
             data = []
             for auc in auctions:
+                if (('bin' in auc and auc['bin']) or auc['end'] / 1000 < time.time()) and auc['bids']:
+                    continue  # Stop updating - gets caught by num sold
                 nbt_data, *_ = Auction.decode_item(auc['item_bytes'])
                 value = await self.calculate_worth(nbt_data)
                 price = max(auc['starting_bid'], auc['highest_bid_amount'])
                 timestamp = auc['end'] // 1000
                 data.append((auc['uuid'], Auction.get_name(nbt_data), price, auc['auctioneer'], value, timestamp,
                              'bin' in auc and auc['bin'], auc['item_bytes'], self.run_counter))
-            async with db.acquire() as conn:
+            async with self.db.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.executemany(
                         "INSERT INTO auctions VALUES (%s, %s, %s, %s, %s, FROM_UNIXTIME(%s), %s, %s, %s)"
@@ -196,10 +212,9 @@ class AuctionGrabber(Thread):
         except aiohttp.ServerDisconnectedError:
             pass
 
-    @staticmethod
     @cached(ttl=300)
-    async def get_price(item):
-        async with db.acquire() as conn:
+    async def get_price(self, item):
+        async with self.db.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT LatestPrice(%s)", (item,))
                 price = await cur.fetchone()
@@ -255,6 +270,17 @@ class AuctionGrabber(Thread):
 # todo Deal with fabled / reforge stones
 # todo Handle aliases better
 
+
+async def get_db_connection():
+    return await aiomysql.create_pool(
+        host=conf['db']['host'],
+        port=conf['db']['port'],
+        user=conf['db']['username'],
+        password=conf['db']['password'],
+        db=conf['db']['database'],
+        loop=asyncio.get_running_loop(), minsize=60, maxsize=100, autocommit=True)
+
+
 path = pathlib.Path("config.toml")
 if not path.exists():
     with open("config.toml", "a+") as config_file:
@@ -264,19 +290,14 @@ if not path.exists():
 with open("config.toml") as config_file:
     conf = toml.loads(config_file.read())
 
+CYCLE = conf['app']['cycle']
 loop = asyncio.get_event_loop()
-db = loop.run_until_complete(aiomysql.create_pool(
-    host=conf['db']['host'],
-    port=conf['db']['port'],
-    user=conf['db']['username'],
-    password=conf['db']['password'],
-    db=conf['db']['database'],
-    loop=loop, minsize=60, maxsize=100, autocommit=True))
-
+db = loop.run_until_complete(get_db_connection())
+loop.run_until_complete(configure_database())
 app = Quart(__name__)
 
 
-@app.route("/flips")
+@app.route("/api/flips")
 async def flips():
     buy = 'bin' in quart.request.args
     min_profit = quart.request.args.get("profit", default=100_000, type=int)
@@ -284,6 +305,9 @@ async def flips():
         return {'error': 'Bad Request! Profit cannot be negative'}, 400
     max_money = quart.request.args.get("money", default=-1)
     page = (quart.request.args.get("page", default=1, type=int) - 1) * 50
+    counter = app.config['grabber'].run_counter
+    update_counter = counter - (1 if app.config['grabber'].updating else 0)
+    update_counter = CYCLE if update_counter == -1 else update_counter
     async with db.acquire() as conn:
         async with conn.cursor(DictCursor) as cur:
             await cur.execute(
@@ -300,35 +324,35 @@ async def flips():
                 "  LEFT JOIN (SELECT LatestPrice(item_name) AS latest_price, auctions.id FROM auctions)"
                 "  p ON p.id = auctions.id "
                 "WHERE (auctions.price < %s OR 1=%s) AND extra_value + p.latest_price - %s > CalcTax(price) AND "
-                " (buy_it_now=%s or 1=%s)"
+                " (buy_it_now=%s or 1=%s) AND (updated=%s or updated=%s) AND ending > NOW()"
                 "ORDER BY buy_it_now DESC, ending LIMIT %s, %s",
-                (max_money, max_money == -1, min_profit, buy, buy, page, page + 50))  # todo bins
-            dic = {'last_update': app.config['grabber'].last_update, 'auctions': await cur.fetchall()}
-            print(dic)
-            return dic
+                (max_money, max_money == -1, min_profit, buy, buy, counter,
+                 update_counter if app.config['grabber'].updating else counter, page, page + 50))
+            dic = {'last_update': app.config['grabber'].last_update // 1000, 'auctions': await cur.fetchall()}
+            return jsonify(dic)
 
 
-@app.route("/price/<item>")  # todo make into template
+@app.route("/api/price/<item>")  # todo make into template
 async def get_price(item):
     async with db.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT LatestPrice(%s)", (item,))
-            return {'item': item,
-                    'price': (await cur.fetchone())[0],
-                    'last_update': app.config['grabber'].last_update}  # todo handle alias
+            return jsonify({'item': item,
+                            'price': (await cur.fetchone())[0],
+                            'last_update': app.config['grabber'].last_update})  # todo handle alias
 
 
-@app.route("/prices/<item>")
+@app.route("/api/prices/<item>")
 async def get_prices(item):
     async with db.acquire() as conn:
         async with conn.cursor(DictCursor) as cur:
             await cur.execute("SELECT price, time_checked FROM price WHERE item_name=%s", (item,))
-            return {'item': item,
-                    'prices': await cur.fetchall()}
+            return jsonify({'item': item,
+                            'prices': await cur.fetchall()})
 
 
 if __name__ == "__main__":
-    thread = AuctionGrabber(conf, loop)
+    thread = AuctionGrabber(conf)
     thread.start()
-    # app.config['grabber'] = thread
-    # app.run(host="127.0.0.1", port=5000, loop=loop)
+    app.config['grabber'] = thread
+    app.run(host=conf['app']['host'], port=conf['app']['port'], loop=loop)

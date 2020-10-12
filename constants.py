@@ -48,6 +48,11 @@ port = 3306
 username = ""
 password = ""
 database = ""
+
+[app]
+host = "127.0.0.1"
+port = 5000
+cycle = 10
 """
 
 PERCENTAGE_VALUE = .85    # The cost multiplier of extra attributes once added to an item
@@ -56,4 +61,3 @@ BAZAAR_ENDPOINT = r'https://api.hypixel.net/skyblock/bazaar?key={}'
 PROFILE_ENDPOINT = r'https://api.hypixel.net/skyblock/profile?key={}&profile={}'
 TOKEN_TEST = r'https://api.hypixel.net/token?key={}'
 WIKI_API = "https://hypixel-skyblock.fandom.com/api/v1/Search/List?query={}&limit=1"
-CYCLE = 10
